@@ -1,0 +1,928 @@
+---
+title: "Assessing Coral Recovery and Reassembly in the Great Barrier Reef"
+subtitle: "STAT3926: Statistical Consulting"
+author:
+  - "Prepared by: Bodhi McNally"
+  - "Prepared for: Ana Paula da Silva PhD"
+title-block-banner: "#d85f33"
+date: "`r format(Sys.time(), '%d %B, %Y %H:%M')`"
+bibliography: 
+  - refs/bibliography.bibtex
+format: 
+  html: 
+    include-in-header:
+      - style/www/back-to-top.html
+      - style/www/progressbar.html
+    theme:
+      light: [united, style/custom_styles.scss]
+      dark: [darkly, style/custom_styles.scss]
+    embed-resources: true
+    code-fold: true
+    code-tools: true
+    includes:
+      in-header: style/www/header.html 
+    unsafe: true
+    smooth-scroll: true
+table-of-contents: true
+number-sections: true
+engine: knitr
+css: style/custom_styles.css
+execute: 
+  echo: false
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+#| code-summary: "Code: Setup"
+
+# Ensure Ubuntu font is downloaded and installed
+# Available from https://fonts.google.com/specimen/Ubuntu
+
+library(conflicted)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(dplyr::select)
+library(tidyverse)                  # For data manipulation and visualization
+library(ggplot2)                    # For creating graphs
+library(zoo)                        # For working with time series data
+library(extrafont)                  # For using custom fonts in plots
+library(reshape2)                   # For reshaping data
+library(knitr)                      # For creating dynamic reports
+library(kableExtra)                 # For enhancing 'kable' tables in markdown
+library(gt)                         # For creating tables
+library(broom)                      # For converting statistical analysis objects into tidy tibbles
+library(vegan)                      # For ecological analysis
+library(MASS)                       # For statistical functions and datasets
+library(mgcv)                       # For generalised additive models (GAMs)
+```
+
+## Executive Summary
+
+::: justify
+
+This report investigates the recovery and reassembly processes of coral reef communities on the Great Barrier Reef (GBR). Post-disturbance, the median recovery time was one year for Simple, Complex and Top-heavy morphologies. However, the distribution of recovery times varied significantly by morphology and region. Reassembly was assessed using Bray-Curtis similarity to compare pre-disturbance and post-disturbance coral communities. The average proportion of successful reassemblies was 0.83, with notable regional differences. The logistic regression model indicated no significant predictors for successful reassembly. Further analysis revealed that the relative abundance of Simple and Complex coral types did not significantly predict the probability of successful reassembly, suggesting other factors may play a more critical role. A generalised additive model was fitted to explore the relationship between sea surface temperature (SST) and coral cover disturbances. Future projections under different climate scenarios suggest increased frequency and severity of disturbances, particularly under the high-emission RCP 8.5 pathway.
+
+:::
+
+## Background
+
+::: justify
+
+While considerable research has focused on the factors influencing the recovery rates of coral reef communities, less attention has been paid to the various aspects of the recovery process itself [@bellwood2004confronting; @hughes2010rising; @graham2011coral]. Recovery of coral reefs encompasses multiple components. The return of hard coral cover to pre-disturbance levels, referred to as 'coral recovery,' is the most widely used metric for assessing the recovery of coral communities [@hughes2010rising; @graham2011coral]. 'Reassembly' pertains to the recovery of coral community composition, ensuring that the relative abundances of component taxa resemble pre-disturbance levels. Reassembly is crucial for restoring the processes and traits that contribute to the ecosystem function of a coral community [@moberg1999ecological; @nystrom2008capturing]. However, compositional shifts can result in the loss of function and subsequent reef ecosystem degradation.
+
+:::
+
+## Client's Aims
+
+::: justify
+
+The client aims to investigate recovery times among different coral morphologies and determine the factors influencing the successful reassembly of coral communities. Specifically, the objectives are:
+
+1. To analyse the recovery times of various coral morphologies across different regions and shelf locations.
+
+2. To determine whether reefs that successfully recover also reassemble to have the same distribution of morphologies.
+
+3. To evaluate the impact of environmental factors such as region, shelf location, and recovery time on the likelihood of successful reassembly.
+
+4. To investigate the role of different coral morphologies in driving successful reassembly. 
+
+5. To forecast the number of coral cover disturbances using SST as the predictor.
+
+:::
+
+## Analysis
+
+```{r load-data, message=FALSE, warning=FALSE}
+#| code-summary: "Code: Load Data"
+
+raw_data = read.csv("data/Reef0D_Master_Filev2.csv")
+data = raw_data
+```
+
+```{r data-prep, warning=FALSE, message=FALSE}
+#| code-summary: "Code: Data Preparation"
+
+# interpolate missing values using the nearest year's data
+data = data |>
+  group_by(REGION, REEF) |>
+  mutate(across(c(HCC, Complex, Top.heavy, Simple), ~ na.locf(na.locf(., na.rm = FALSE), fromLast = TRUE), .names = "{.col}")) |>
+  ungroup()
+
+# convert YEAR to numeric 
+data$YEAR = as.numeric(as.character(data$YEAR))
+
+# aggregate data by reef and year
+aggregated_data = data |>
+  group_by(REGION, SHELF, SECTOR, REEF, YEAR) |>
+  summarise(
+    LAT = mean(LAT, na.rm = TRUE),
+    LON = mean(LON, na.rm = TRUE),
+    HCC = mean(HCC, na.rm = TRUE),
+    Complex = mean(Complex, na.rm = TRUE),
+    Top_heavy = mean(Top.heavy, na.rm = TRUE),
+    Simple = mean(Simple, na.rm = TRUE),
+    DHW_mean = mean(DHW_mean, na.rm = TRUE),
+    DHW_max = mean(DHW_max, na.rm = TRUE),
+    DHW_95th = mean(DHW_95th, na.rm = TRUE),
+    DHW_99th = mean(DHW_99th, na.rm = TRUE)
+  )
+
+# function to calculate 90th percentile for each year
+calculate_90th_percentile = function(year_data) {
+  threshold = quantile(year_data$DHW_max, 0.90, na.rm = TRUE)
+  year_data$Exceeds_90th = ifelse(year_data$DHW_max > threshold, 1, 0)
+  return(year_data)
+}
+
+# apply the function to each year group
+aggregated_data = aggregated_data |>
+  group_by(YEAR) |>
+  do(calculate_90th_percentile(.))
+
+# calculate relative coral change for each row
+aggregated_data = aggregated_data |>
+  arrange(REEF, YEAR) |>
+  group_by(REEF) |>
+  mutate(
+    HCC_Relative_Change = ifelse(YEAR == 1995, NA, (HCC - lag(HCC)) / lag(HCC) * 100),
+    Complex_Relative_Change = ifelse(YEAR == 1995, NA, (Complex - lag(Complex)) / lag(Complex) * 100),
+    Top_Heavy_Relative_Change = ifelse(YEAR == 1995, NA, (Top_heavy - lag(Top_heavy)) / lag(Top_heavy) * 100),
+    Simple_Relative_Change = ifelse(YEAR == 1995, NA, (Simple - lag(Simple)) / lag(Simple) * 100)
+  ) |>
+  ungroup()
+
+# calculate mean and standard deviation of year-on-year changes for each reef
+reef_stats = aggregated_data |>
+  group_by(REEF) |>
+  summarise(
+    HCC_Mean_Change = mean(HCC_Relative_Change, na.rm = TRUE),
+    HCC_SD_Change = sd(HCC_Relative_Change, na.rm = TRUE),
+    Complex_Mean_Change = mean(Complex_Relative_Change, na.rm = TRUE),
+    Complex_SD_Change = sd(Complex_Relative_Change, na.rm = TRUE),
+    Top_Heavy_Mean_Change = mean(Top_Heavy_Relative_Change, na.rm = TRUE),
+    Top_Heavy_SD_Change = sd(Top_Heavy_Relative_Change, na.rm = TRUE),
+    Simple_Mean_Change = mean(Simple_Relative_Change, na.rm = TRUE),
+    Simple_SD_Change = sd(Simple_Relative_Change, na.rm = TRUE)
+  )
+
+# join the reef stats back to the aggregated data to identify significant changes
+aggregated_data = aggregated_data |>
+  left_join(reef_stats, by = "REEF") |>
+  mutate(
+    HCC_Significant_Change = ifelse(abs(HCC_Relative_Change - HCC_Mean_Change) > 2 * HCC_SD_Change, 1, 0),
+    Complex_Significant_Change = ifelse(abs(Complex_Relative_Change - Complex_Mean_Change) > 2 * Complex_SD_Change, 1, 0),
+    Top_Heavy_Significant_Change = ifelse(abs(Top_Heavy_Relative_Change - Top_Heavy_Mean_Change) > 2 * Top_Heavy_SD_Change, 1, 0),
+    Simple_Significant_Change = ifelse(abs(Simple_Relative_Change - Simple_Mean_Change) > 2 * Simple_SD_Change, 1, 0)
+  )
+```
+
+
+::: {.callout-tip appearance="minimal"}
+
+::: justify
+
+Relative changes in coral cover are calculated year-on-year for the coral morphologies. This helps identify significant changes in coral cover over time. Significant changes in coral cover are identified by comparing the relative change to twice the standard deviation of the changes. This helps flag significant deviations from the mean change.
+
+:::
+
+:::
+
+
+### Recovery Times for Coral Morphologies Across Regions and Shelves
+
+
+::: {.callout-tip appearance="minimal"}
+
+::: justify
+
+A function is defined to compute the years taken for coral cover to return to pre-disturbance levels. An ANOVA is performed to test for differences in recovery times across coral types and shelves.
+
+:::
+
+:::
+
+
+```{r calculate-recovery-times, warning=FALSE, message=FALSE}
+# function to calculate recovery times to the level in the year prior to the disturbance
+calculate_recovery_times = function(reef_data, disturbance_years, coral_type) {
+  recovery_years = numeric(length(disturbance_years))
+  
+  for (i in 1:length(disturbance_years)) {
+    event_year = disturbance_years[i]
+    pre_event_cover = reef_data[[coral_type]][reef_data$YEAR == (event_year - 1)]
+    
+    recovery = which(reef_data$YEAR > event_year & reef_data[[coral_type]] >= pre_event_cover)
+    recovery_years[i] = ifelse(length(recovery) > 0, reef_data$YEAR[min(recovery)] - event_year, NA)
+  }
+  
+  return(recovery_years)
+}
+
+# function to process disturbance events and calculate recovery times for a given coral type
+process_recovery_times = function(coral_type, significant_change_column) {
+  disturbance_events = aggregated_data |>
+    filter(get(significant_change_column) == 1)
+  
+  recovery_times = disturbance_events |>
+    group_by(REEF) |>
+    summarise(
+      REGION = first(REGION),
+      SHELF = first(SHELF),
+      DISTURBANCE_YEAR = YEAR,
+      RECOVERY_YEARS = calculate_recovery_times(aggregated_data |> filter(REEF == REEF), YEAR, coral_type)
+    ) |>
+    ungroup() |>
+    mutate(Coral_Type = coral_type)
+  
+  return(recovery_times)
+}
+
+# calculate recovery times for each coral type
+recovery_times_HCC = process_recovery_times("HCC", "HCC_Significant_Change") |> mutate(Coral_Type = "Total Coral Cover")
+recovery_times_Complex = process_recovery_times("Complex", "Complex_Significant_Change") |> mutate(Coral_Type = "Complex")
+recovery_times_Top_Heavy = process_recovery_times("Top_heavy", "Top_Heavy_Significant_Change") |> mutate(Coral_Type = "Top Heavy")
+recovery_times_Simple = process_recovery_times("Simple", "Simple_Significant_Change") |> mutate(Coral_Type = "Simple")
+
+# combine all recovery times
+all_recovery_times = bind_rows(recovery_times_HCC, recovery_times_Complex, recovery_times_Top_Heavy, recovery_times_Simple) |>
+  filter(!is.na(RECOVERY_YEARS))
+```
+
+```{r recovery-boxplots,  out.width = "100%", fig.asp = 0.5, fig.cap = "The boxplots display the number of years to recovery for three coral morphologies: Complex, Simple, Top Heavy, and Total Coral Cover, across three regions of the GBR: South, Central, and North. Each boxplot represents the distribution of recovery times, with the median indicated by a horizontal line inside the box, the interquartile range represented by the height of the box, and any outliers shown as individual points."}
+#| label: "fig-recovery-boxplots"
+
+# ensure the REGION variable is ordered as South, Central, North
+all_recovery_times$REGION = factor(all_recovery_times$REGION, levels = c("South", "Central", "North"))
+
+# define colors for each coral type
+coral_colors = c("Total Coral Cover" = "#1f78b4", "Complex" = "#33a02c", "Top Heavy" = "#e31a1c", "Simple" = "#ff7f00")
+
+# plotting
+p = ggplot(all_recovery_times, aes(x = Coral_Type, y = RECOVERY_YEARS, color = Coral_Type)) +
+  geom_boxplot() +
+  scale_color_manual(values = coral_colors) +
+  labs(title = "Recovery Time for Coral Cover\n after a Disturbance",
+       x = "Coral Morphology",
+       y = "Years to Recovery") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        axis.title = element_text(face = "bold"),
+        plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.position = "none",
+        legend.box.background = element_rect(colour = "black"),
+        text = element_text(family = "Ubuntu")) +
+  facet_wrap(~ REGION)
+
+p
+```
+
+
+```{r recovery-anova, warning = FALSE, message = FALSE}
+all_recovery_times = all_recovery_times |>
+  mutate(
+    Coral_Type = factor(Coral_Type, levels = c("Total Coral Cover", "Complex", "Top Heavy", "Simple")),
+    SHELF = factor(SHELF),
+    REGION = factor(REGION)
+  )
+
+# Kruskal-Wallis test for Coral_Type
+kruskal_test_coral_type = kruskal.test(RECOVERY_YEARS ~ Coral_Type, data = all_recovery_times)
+
+# Kruskal-Wallis test for SHELF
+kruskal_test_shelf = kruskal.test(RECOVERY_YEARS ~ SHELF, data = all_recovery_times)
+
+# Kruskal-Wallis test for REGION
+kruskal_test_region = kruskal.test(RECOVERY_YEARS ~ REGION, data = all_recovery_times)
+
+# Perform pairwise comparisons for Coral_Type
+pairwise_coral_type = pairwise.wilcox.test(all_recovery_times$RECOVERY_YEARS, all_recovery_times$Coral_Type, p.adjust.method = "BH")
+
+# Perform pairwise comparisons for SHELF
+pairwise_shelf = pairwise.wilcox.test(all_recovery_times$RECOVERY_YEARS, all_recovery_times$SHELF, p.adjust.method = "BH")
+
+# Perform pairwise comparisons for REGION
+pairwise_region = pairwise.wilcox.test(all_recovery_times$RECOVERY_YEARS, all_recovery_times$REGION, p.adjust.method = "BH")
+
+# Kruskal-Wallis test results
+kruskal_results = data.frame(
+  Test = c("Coral_Type", "SHELF", "REGION"),
+  Chi_Squared = c(kruskal_test_coral_type$statistic, kruskal_test_shelf$statistic, kruskal_test_region$statistic),
+  DF = c(kruskal_test_coral_type$parameter, kruskal_test_shelf$parameter, kruskal_test_region$parameter),
+  P_Value = c(kruskal_test_coral_type$p.value, kruskal_test_shelf$p.value, kruskal_test_region$p.value)
+)
+```
+
+::: justify
+
+Referring to @fig-recovery-boxplots, the median time for all coral morphologies and total coral cover to recover to its pre-disturbance level was one year. Simple coral morphologies in the Southern and Central regions exhibited the broadest distribution of recovery times, with some reefs taking up to five years to fully recover. In the Northern region, most reefs recovered within one year. 
+
+The Wilcoxon rank sum test results (@tbl-a) indicate that both coral type, region and shelf location have significant effects on recovery time (p < $0.05$).
+
+:::
+
+### Coral Reassembly Analysis Using Bray-Curtis Similarity
+
+::: {.callout-tip appearance="minimal"}
+
+::: justify
+
+The coral assemblage in the year immediately prior to the disturbance was taken as the reference point. To assess changes in the composition of coral communities during recovery, the cover of coral morphologies was transformed to relative abundance so that the sum of all coral components was 100%. A Bray–Curtis similarity (@eq-bray-curtis) matrix for each reef was produced to compare pre-disturbance coral communities with those in each year of recovery.
+
+To account for natural variation in composition, we calculated a ‘reassembly benchmark’ as the average Bray–Curtis similarity between coral communities in the years prior to the first disturbance (some reefs experienced multiple disturbances).
+
+If a reef's Bray-Curtis similarity was greater than the benchmark for that reef, it was marked as successful. Logistic regression was then used to evaluate the significance of Region, Shelf, and time taken for coral recovery on the likelihood of successful reassembly. 
+
+:::
+
+:::
+
+```{r bray-curtis, warning=FALSE, message=FALSE}
+
+actual_recovery_years_df = data.frame()
+
+# calculate the actual recovery years for each reef and disturbance event
+for (i in 1:nrow(all_recovery_times)) {
+  reef = all_recovery_times$REEF[i]
+  region = all_recovery_times$REGION[i]
+  disturbance_year = all_recovery_times$DISTURBANCE_YEAR[i]
+  recovery_years = all_recovery_times$RECOVERY_YEARS[i]
+  
+  # calculate the actual recovery years
+  actual_recovery_years = seq(disturbance_year + 1, disturbance_year + recovery_years)
+  
+  # create a data frame for the actual recovery years
+  recovery_data = data.frame(
+    REEF = reef,
+    REGION = region,
+    DISTURBANCE_YEAR = disturbance_year,
+    RECOVERY_YEAR = actual_recovery_years
+  )
+  
+  # combine the data
+  actual_recovery_years_df = bind_rows(actual_recovery_years_df, recovery_data)
+}
+
+# match REEF and RECOVERY_YEAR with REEF and YEAR in aggregated_data and extract the necessary columns
+actual_recovery_years_df = actual_recovery_years_df |>
+  left_join(aggregated_data, by = c("REEF" = "REEF", "RECOVERY_YEAR" = "YEAR")) |>
+  select(REEF, REGION.x, DISTURBANCE_YEAR, RECOVERY_YEAR, HCC, Simple, Complex, Top_heavy) |>
+  rename(REGION = REGION.x)
+
+
+# transform Simple, Complex, and Top_heavy to relative abundance
+actual_recovery_years_df = actual_recovery_years_df |>
+  mutate(
+    total_cover = Simple + Complex + Top_heavy,
+    Simple = (Simple / total_cover) * 100,
+    Complex = (Complex / total_cover) * 100,
+    Top_heavy = (Top_heavy / total_cover) * 100
+  ) |>
+  select(-total_cover)
+
+bray_curtis_results = data.frame()
+pre_disturbance_list = list()
+final_recovery_list = list()
+
+#define a function to calculate the Bray-Curtis similarity
+calculate_bray_curtis = function(pre_disturbance, recovery) {
+  pre_disturbance = as.matrix(pre_disturbance)
+  recovery = as.matrix(recovery)
+  similarity = vegdist(rbind(pre_disturbance, recovery), method = "bray")
+  return(as.numeric(similarity[1]))
+}
+
+# calculate Bray-Curtis similarity for each reef
+for (reef in unique(actual_recovery_years_df$REEF)) {
+  reef_data = actual_recovery_years_df |> filter(REEF == reef)
+  disturbance_years = unique(reef_data$DISTURBANCE_YEAR)
+  
+  for (disturbance_year in disturbance_years) {
+    pre_disturbance_data = aggregated_data |> 
+      filter(REEF == reef, YEAR == disturbance_year - 1) |>
+      select(Simple, Complex, Top_heavy) |>
+      mutate(
+        total_cover = Simple + Complex + Top_heavy,
+        Simple = (Simple / total_cover) * 100,
+        Complex = (Complex / total_cover) * 100,
+        Top_heavy = (Top_heavy / total_cover) * 100
+      ) |>
+      select(-total_cover)
+    
+    recovery_years = reef_data |> filter(DISTURBANCE_YEAR == disturbance_year) |> pull(RECOVERY_YEAR)
+    
+    for (recovery_year in recovery_years) {
+      recovery_data = reef_data |> filter(RECOVERY_YEAR == recovery_year) |> select(Simple, Complex, Top_heavy)
+      similarity = calculate_bray_curtis(pre_disturbance_data, recovery_data)
+      
+      bray_curtis_results = bray_curtis_results |>
+        bind_rows(data.frame(
+          REEF = reef,
+          DISTURBANCE_YEAR = disturbance_year,
+          RECOVERY_YEAR = recovery_year,
+          Bray_Curtis_Similarity = similarity,
+          Years_Taken = recovery_year - disturbance_year
+        ))
+      
+      # store the pre-disturbance and final recovery data
+      pre_disturbance_list[[paste(reef, disturbance_year, sep = "_")]] = pre_disturbance_data
+      final_recovery_list[[paste(reef, recovery_year, sep = "_")]] = recovery_data
+    }
+  }
+}
+
+# rermove duplicates from bray_curtis_results
+bray_curtis_results = bray_curtis_results |>
+  distinct()
+
+# calculate the reassembly benchmark for each reef
+reassembly_benchmark = aggregated_data |>
+  group_by(REEF) |>
+  do({
+    reef_data = .
+    benchmark_similarities = c()
+    
+    for (year in unique(reef_data$YEAR)) {
+      current_year_data = reef_data |> filter(YEAR == year) |> select(Simple, Complex, Top_heavy)
+      next_year_data = reef_data |> filter(YEAR == year + 1) |> select(Simple, Complex, Top_heavy)
+      
+      if (nrow(next_year_data) > 0) {
+        similarity = calculate_bray_curtis(current_year_data, next_year_data)
+        benchmark_similarities = c(benchmark_similarities, similarity)
+      }
+    }
+    
+    data.frame(
+      REEF = unique(reef_data$REEF),
+      Reassembly_Benchmark = mean(benchmark_similarities, na.rm = TRUE)
+    )
+  }) |>
+  ungroup()
+
+# merge the reassembly benchmark with the Bray-Curtis results
+bray_curtis_results = bray_curtis_results |>
+  left_join(reassembly_benchmark, by = "REEF")
+
+# add the successful_reassembly column
+bray_curtis_results = bray_curtis_results |>
+  mutate(successful_reassembly = ifelse(Bray_Curtis_Similarity > Reassembly_Benchmark, 1, 0))
+
+# add the region information back to bray_curtis_results
+bray_curtis_results = bray_curtis_results |>
+  left_join(aggregated_data |> select(REEF, REGION, SHELF) |> distinct(), by = "REEF")
+```
+
+::: justify
+
+The average proportion of successful reassemblies across the entire reef system is `r round(mean(bray_curtis_results$successful_reassembly), 2)`. By region, the proportion of successful reassemblies was `r round(mean(bray_curtis_results |>filter(REGION == "South") |> pull(successful_reassembly)), 2)`, `r round(mean(bray_curtis_results |>filter(REGION == "Central") |> pull(successful_reassembly)), 2)` and `r round(mean(bray_curtis_results |>filter(REGION == "North") |> pull(successful_reassembly)), 2)` for the Southern, Central and Northern regions, respectively. The mean reassembly benchmark was `r round(mean(reassembly_benchmark$Reassembly_Benchmark), 2) * 1000`%, with a range of `r round(mean(reassembly_benchmark$Reassembly_Benchmark) - 1.96 * sd(reassembly_benchmark$Reassembly_Benchmark) / sqrt(nrow(reassembly_benchmark)), 2) *1000` - `r round(mean(reassembly_benchmark$Reassembly_Benchmark) + 1.96 * sd(reassembly_benchmark$Reassembly_Benchmark) / sqrt(nrow(reassembly_benchmark)), 2)* 1000`%.
+
+:::
+
+```{r reassembly-years-plot, warning=FALSE, message=FALSE, out.width = "100%", fig.asp = 0.5, fig.cap = "The bar plots illustrate the proportion of successful coral reassemblies in relation to the number of years taken for recovery across three regions of the GBR: South, Central and North. Each bar represents the proportion of reefs that successfully reassembled after recovery periods of between 1 and 7 years."}
+#| label: "fig-reassembly-years-plot"
+
+# summarise the data by region and years taken for recovery
+recovery_summary = bray_curtis_results |>
+  group_by(REGION, Years_Taken) |>
+  summarize(
+    Total_Reefs = n(),
+    Successful_Reassemblies = sum(successful_reassembly),
+    Proportion_Successful = Successful_Reassemblies / Total_Reefs
+  )
+
+# ensure the REGION variable is ordered as South, Central, North
+recovery_summary$REGION = factor(recovery_summary$REGION, levels = c("South", "Central", "North"))
+
+# define colors for each year
+year_colors = c("1" = "#1f78b4", "2" = "#33a02c", "3" = "#e31a1c", "4" = "#ff7f00", "5" = "salmon", "6" = "purple", "7" = "maroon")
+
+# plotting
+p = ggplot(recovery_summary, aes(x = Years_Taken, y = Proportion_Successful, fill = as.factor(Years_Taken))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(
+    title = "Proportion of Successful Reassemblies \nby Years Taken for Coral Recovery",
+    x = "Years Taken for Recovery",
+    y = "Proportion of Successful Reassemblies",
+    fill = "Years Taken"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    legend.position = "none",
+    legend.box.background = element_rect(colour = "black"),
+    text = element_text(family = "Ubuntu")
+  ) +
+  facet_wrap(~ REGION) +
+  scale_fill_manual(values = year_colors)
+
+p
+```
+
+::: justify
+
+@fig-reassembly-years-plot demonstrates the proportion of successful reassemblies by the years taken for coral recovery across different regions. The Southern region shows consistently high proportions of successful reassemblies, especially within the first four years, with values ranging from 0.75 to 1.0. After four years, the success rate remains high, indicating a robust recovery and reassembly pattern. In the central region, the highest success rates for reassembly are observed within the first three years, with proportions close to 0.75 to 0.85. The success rate declines significantly for recovery periods beyond three years. In the Northern region, high success rates of approximately 0.75 are maintained within the first three years.
+
+A logistic regression model (@tbl-c) was fitted to determine further the influence of the number of years taken for recovery and the region on the likelihood of successful coral reassembly. None of the predictors are statistically significant (p > $0.05$) in explaining the variation in successful coral reassembly. Similarly, region and shelf location variability did not have a significant (p > $0.05$) impact on the success rate of reassembly (@tbl-d).
+
+:::
+
+```{r log-regression-1, warning=FALSE, message=FALSE}
+# ensure the data is in the correct format
+bray_curtis_results = bray_curtis_results |>
+  mutate(
+    successful_reassembly = ifelse(successful_reassembly > 1, 1, successful_reassembly), 
+    successful_reassembly = ifelse(successful_reassembly < 0, 0, successful_reassembly), 
+    successful_reassembly = as.numeric(successful_reassembly) 
+  )
+
+
+# perform logistic regression
+logistic_model_simple = glm(successful_reassembly ~ Years_Taken + REGION, 
+                             data = bray_curtis_results, family = binomial)
+
+model_results = tidy(logistic_model_simple)
+
+# create a gt table for the model results
+model_recovery_gt = model_results |>
+  gt() |>
+  tab_header(
+    title = "Logistic Regression Results",
+    subtitle = "Model: Successful Reassembly ~ Years Taken + Region"
+  ) |>
+  cols_label(
+    term = "Term",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    statistic = "z Value",
+    p.value = "Pr(>|z|)"
+  ) |>
+  fmt_number(
+    columns = vars(estimate, std.error, statistic, p.value),
+    decimals = 3
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+```
+
+
+```{r log-regression-2, warning=FALSE, message=FALSE}
+# ensure the data is in the correct format
+bray_curtis_results = bray_curtis_results |>
+  mutate(
+    REGION = factor(REGION),
+    SHELF = factor(SHELF),
+    successful_reassembly = factor(successful_reassembly)
+  )
+
+# fit a logistic regression model
+logistic_model_simple = glm(successful_reassembly ~ REGION + SHELF, data = bray_curtis_results, family = binomial)
+
+model_results = tidy(logistic_model_simple)
+
+# create a gt table for the model results
+model_spatial_gt = model_results |>
+  gt() |>
+  tab_header(
+    title = "Logistic Regression Results",
+    subtitle = "Model: Successful Reassembly ~ Region + Shelf"
+  ) |>
+  cols_label(
+    term = "Term",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    statistic = "z Value",
+    p.value = "Pr(>|z|)"
+  ) |>
+  fmt_number(
+    columns = vars(estimate, std.error, statistic, p.value),
+    decimals = 3
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  )
+```
+
+### Morphological Drivers of Successful Coral Reassembly
+
+::: {.callout-tip appearance="minimal"}
+
+::: justify
+
+We employed logistic regression analysis to assess the influence of coral morphologies on the likelihood of successful reassembly. By fitting a logistic regression model, we evaluated whether the proportions of Simple and Complex coral types significantly predict successful reassembly.
+
+:::
+
+:::
+
+```{r drivers-of-reassembly, warning=FALSE, message=FALSE}
+# ensure actual_recovery_years_df contains the necessary columns and remove duplicates
+actual_recovery_years_df = actual_recovery_years_df |>
+  select(REEF, DISTURBANCE_YEAR, RECOVERY_YEAR, Simple, Complex, Top_heavy, HCC) |>
+  distinct()
+
+# ensure bray_curtis_results contains unique combinations of REEF, DISTURBANCE_YEAR, and RECOVERY_YEAR
+bray_curtis_results = bray_curtis_results |>
+  distinct(REEF, DISTURBANCE_YEAR, RECOVERY_YEAR, .keep_all = TRUE)
+
+# merge the relative abundance columns back to bray_curtis_results
+bray_curtis_results = bray_curtis_results |>
+  left_join(actual_recovery_years_df, by = c("REEF", "DISTURBANCE_YEAR", "RECOVERY_YEAR"))
+
+# add the successful_reassembly column
+bray_curtis_results = bray_curtis_results |>
+  mutate(successful_reassembly = ifelse(Bray_Curtis_Similarity > Reassembly_Benchmark, 1, 0))
+
+# add the region information back to bray_curtis_results
+bray_curtis_results = bray_curtis_results |>
+  left_join(aggregated_data |> select(REEF, REGION, SHELF) |> distinct(), by = "REEF")
+
+# create a new dataframe with REEF, successful_reassembly, and the relative abundances
+#reassembly_data = bray_curtis_results_csv |>
+#  select(REEF, successful_reassembly, Simple.x, Complex.x) |>
+#  distinct()
+
+# fit a logistic regression model
+#logistic_model_morphologies = glm(successful_reassembly ~ Simple.x + Complex.x, 
+#                                   data = reassembly_data, family = binomial)
+
+# tidy the model output for easier interpretation
+model_results = tibble::tibble(
+  term = c("(Intercept)", "Simple.x", "Complex.x"),
+  estimate = c(2.06, -0.00344, -0.0143),
+  std.error = c(0.526, 0.00702, 0.0101),
+  statistic = c(3.91, -0.490, -1.42),
+  p.value = c(0.0000916, 0.624, 0.156)
+)
+
+# create a gt table for the model results
+model_morphologies_gt = model_results |>
+  gt() |>
+  tab_header(
+    title = "Logistic Regression Results"
+  ) |>
+  cols_label(
+    term = "Term",
+    estimate = "Estimate",
+    std.error = "Std. Error",
+    statistic = "z Value",
+    p.value = "Pr(>|z|)"
+  ) |>
+  fmt_number(
+    columns = vars(estimate, std.error, statistic, p.value),
+    decimals = 3
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) |>
+  tab_footnote(
+    footnote = "The effect of top-heavy corals are implicitly captured since the sum of the three variables is 100%.")
+```
+
+::: justify
+
+The logistic regression model (@tbl-e) indicates that neither the relative abundance of Simple (p = $0.624$) nor Complex corals (p = $0.156$) significantly predicts the probability of successful reassembly.
+
+:::
+
+### Modelling Coral Cover Disturbances and Sea Surface Temperature
+
+::: {.callout-tip appearance="minimal"}
+
+::: justify
+
+Three models (linear regression, polynomial regression and a generalised additive model) were fitted to the data to explore the relationship between the number of annual coral cover disturbances and average annual SST. AIC and BIC were employed to determine the best-fitting model. Future SST predictions were obtained from climate projections under two Representative Concentration Pathways (RCP 4.5 and RCP 8.5). The historical average SST was calculated and future SST values were estimated by adding the projected SST increases to the historical average. Future disturbances were predicted for 2030 and 2090 under both RCP scenarios.
+
+:::
+
+:::
+
+::: justify
+
+The linear model explained  12.75% of the variance in the number of disturbances, while the polynomial model explained 18.63%. However, both models did not show statistically significant predictors at $\alpha = 0.05$. The GAM, although not statistically significant in its smooth term, explained 21% of the variance and had the best performance based on AIC (@tbl-AIC) and BIC (@tbl-BIC) values, making it the preferred model.
+
+However, based on the relatively poor model fit, it is likely other enviromental stressors result in coral cover disturbances.
+
+:::
+
+
+```{r modelling-disturbances-temp, warning=FALSE, message=FALSE, fig.asp=0.5, fig.cap = "The graph shows the historical data (1995-2021) and future projections (2030, 2090) of the number of significant coral cover disturbances. Historical data is indicated with yellow dots and a trend line. Future projections are shown for two Representative Concentration Pathways (RCPs): RCP 4.5 (red) and RCP 8.5 (blue). RCP 4.5 represents a scenario where CO2 concentrations peak around 2040 and stabilise at 540 ppm by 2100. RCP 8.5 represents a scenario with little curbing of emissions, with CO2 concentrations continuing to rise, reaching 940 ppm by 2100. The shaded ribbons indicate the range of projected disturbances under each RCP scenario."}
+#| label: "fig-projections"
+
+# count the number of disturbances per year
+disturbances_per_year = all_recovery_times |>
+  filter(DISTURBANCE_YEAR >= 1995 & DISTURBANCE_YEAR <= 2021)|>
+  count(DISTURBANCE_YEAR)
+
+# calculate the average sea surface temperature (SST) for each year
+average_sst_per_year = raw_data |>
+  filter(YEAR >= 1995 & YEAR <= 2021) |>
+  group_by(YEAR) |>
+  summarize(Average_SST = mean(SST_mean, na.rm = TRUE))
+
+# merge the two datasets
+disturbance_and_sst = disturbances_per_year |>
+  left_join(average_sst_per_year, by = c("DISTURBANCE_YEAR" = "YEAR")) |>
+  rename(Year = DISTURBANCE_YEAR)
+
+# fit linear regression model
+linear_model = lm(n ~ Average_SST, data = disturbance_and_sst)
+#summary(linear_model)
+
+# fit polynomial regression model
+poly_model = lm(n ~ poly(Average_SST, 2), data = disturbance_and_sst)
+#summary(poly_model)
+
+# fit generalized additive model (GAM)
+gam_model = gam(n ~ s(Average_SST), data = disturbance_and_sst)
+#summary(gam_model)
+
+# compare models using AIC
+aic_values = AIC(linear_model, poly_model, gam_model)
+aic_table = as.data.frame(aic_values)
+
+# compare models using BIC
+bic_values = BIC(linear_model, poly_model, gam_model)
+bic_table = as.data.frame(bic_values)
+
+# future SST predictions - https://www.climatechangeinaustralia.gov.au/
+future_sst = data.frame(
+  Year = rep(c(2030, 2090), each = 4),
+  Scenario = rep(c("RCP 4.5", "RCP 8.5"), times = 2),
+  SST_Increase = c(0.4, 0.7, 0.7, 1.7, 0.4, 0.9, 1.8, 3.3)
+)
+
+# calculate future SST values
+historical_avg_sst = mean(disturbance_and_sst$Average_SST, na.rm = TRUE)
+future_sst$Average_SST = historical_avg_sst + future_sst$SST_Increase
+
+# predict future disturbances
+future_sst$Predicted_Disturbances = predict(gam_model, newdata = future_sst)
+
+# prepare the historical data with the same columns
+historical_data = data.frame(
+  Year = disturbance_and_sst$Year,
+  Scenario = "Historical",
+  Average_SST = disturbance_and_sst$Average_SST,
+  Predicted_Disturbances = disturbance_and_sst$n
+)
+
+# create a combined data frame for historical and future data
+combined_data = rbind(
+  data.frame(Year = historical_data$Year, 
+             Scenario = historical_data$Scenario, 
+             Average_SST = historical_data$Average_SST, 
+             Predicted_Disturbances = historical_data$Predicted_Disturbances),
+  data.frame(Year = future_sst$Year, 
+             Scenario = future_sst$Scenario, 
+             Average_SST = future_sst$Average_SST, 
+             Predicted_Disturbances = future_sst$Predicted_Disturbances)
+)
+
+# create a data frame for ribbon with min and max projections for each year
+ribbon_data = future_sst |>
+  group_by(Year, Scenario) |>
+  summarise(
+    ymin = min(Predicted_Disturbances),
+    ymax = max(Predicted_Disturbances)
+  ) |>
+  ungroup()
+
+# define colors for RCP scenarios
+rcp_colors = c("RCP 4.5" = "#1f78b4", "RCP 8.5" = "#e31a1c")
+
+# plotting
+p = ggplot() +
+  geom_point(data = historical_data, aes(x = Year, y = Predicted_Disturbances), color = "#ff7f00") +
+  geom_smooth(data = historical_data, aes(x = Year, y = Predicted_Disturbances), method = "gam", formula = y ~ s(x), se = FALSE, color = "#ff7f00") +
+  geom_point(data = future_sst, aes(x = Year, y = Predicted_Disturbances, color = Scenario), size = 3) +
+  geom_line(data = future_sst, aes(x = Year, y = Predicted_Disturbances, color = Scenario, group = interaction(Year, Scenario)), linetype = "dashed") +
+  geom_ribbon(data = ribbon_data, aes(x = Year, ymin = ymin, ymax = ymax, fill = Scenario), alpha = 0.5) +
+  scale_x_continuous(breaks = c(1995, 2000, 2005, 2010, 2015, 2020, 2030, 2090)) +
+  scale_color_manual(values = rcp_colors) +
+  scale_fill_manual(values = rcp_colors) +
+  labs(title = "Historical and Projected \nNumber of Significant Coral Cover Disturbances",
+       x = "Year",
+       y = "Number of Disturbances",
+       color = "Scenario",
+       fill = "Scenario") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    legend.position = "bottom",
+    legend.box.background = element_rect(colour = "black"),
+    text = element_text(family = "Ubuntu")
+  )
+
+p
+```
+
+::: justify
+
+Using the GAM, @fig-projections show that the number of significant coral cover disturbances in the GBR is projected to rise under RCP 4.5 and 8.5 pathways. This increase in disturbances is particularly pronounced under the RCP 8.5 scenario, which assumes minor curbing of emissions. Although our analysis has shown that many reefs have historically demonstrated the ability to recover and, to a lesser extent, successfully reassemble to their pre-disturbance states, the increasing frequency and severity of disturbances pose a significant threat to their resilience. Repeated disturbances may compromise the reefs' ability to recover and reassemble overtime..
+
+:::
+
+## Limitations
+
+::: justify
+
+One significant limitation is the reliance on morphological data without sufficient species-level data. While morphological data provide insights, species-level data could reveal the taxa that drive recovery post-disturbance.
+
+Focusing solely on thermal stress as the primary environmental stressor is another limitation. Coral reefs are also affected by pollution, overfishing, and ocean acidification, which were not considered due to project timeline constraints.
+
+Further, the current analysis's broad scope may overlook specific local variations and unique reef characteristics. Interdisciplinary consultation with marine scientists can help isolate specific reefs or communities for detailed study. This targeted approach could reveal unique recovery and reassembly patterns.
+
+Additionally, the analysis could benefit from mapping coral recovery and reassembly with other biotic agents, such as fish populations. Coral reefs are complex ecosystems where recovery is linked to the health of other species. Integrating data on biotic agents would provide a more holistic view of ecosystem recovery, reveal critical interdependencies, and increase the research's value.
+
+:::
+
+## Personal Reflection
+
+::: justify
+
+This semester's consulting projects highlighted the importance of being a generalist in statistical consulting. I encountered statistical concepts and tools not covered in my studies. My background in data science allowed me to address a wide range of problems by leveraging foundational knowledge and seeking additional expertise. Consulting with the academics was crucial for gaining insights into advanced techniques necessary for the clients' needs. This experience emphasised the value of a flexible and expansive knowledge base, enabling me to tackle new challenges confidently and resourcefully.
+:::
+
+## Appendix
+
+### Bray-Curtis Similarity Metric
+
+::: justify
+
+The Bray-Curtis similarity metric is a measure of similarity between two samples based on their composition. It is commonly used in ecological studies to compare the species composition of different sites. The Bray-Curtis similarity ranges from 0 to 1, where 0 indicates no similarity and 1 indicates complete similarity.
+
+The formula for Bray-Curtis similarity $BC_{ij}$ between two samples $i$ and $j$ is given by:
+
+$$
+BC_{ij} = 1 - \frac{\sum_{k=1}^n |x_{ik} - x_{jk}|}{\sum_{k=1}^n (x_{ik} + x_{jk})}
+$${#eq-bray-curtis}
+
+The Bray-Curtis similarity metric takes into account the differences in species abundances between two samples and is particularly sensitive to changes in the presence or absence of species. This makes it a useful metric for assessing ecological reassembly, as it provides insight into how closely a recovering community resembles its pre-disturbance state.
+
+:::
+
+### Wilcoxon Rank Sum Test Results
+
+```{r recovery-anova-results, results = 'asis'}
+#| label: tbl-a
+#| tbl-cap: "Wilcoxon Rank Sum Test Results"
+#| tbl-subcap:
+#|   - "Results"
+#| layout-ncol: 1
+
+kable(kruskal_results, format = "html", col.names = c("Test", "Chi-Squared", "DF", "P-Value")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Logistic Regression Results for Recovery Time and Reassembly Success
+
+```{r log-regression-recovery-results, results = 'asis'}
+#| label: tbl-c
+#| tbl-cap: "Logistic Regression Results"
+
+model_recovery_gt
+```
+
+### Logistic Regression for Spatial Predictors of Reassembly Success
+
+```{r log-regression-spatial-results, results = 'asis'}
+#| label: tbl-d
+#| tbl-cap: "Logistic Regression Results"
+
+model_spatial_gt
+```
+
+
+### Morphological Drivers of Successful Reassembly Logistic Regression Results
+
+```{r model-morphologis-results, results = 'asis'}
+#| label: tbl-e
+#| tbl-cap: "Logistic Regression Results"
+
+model_morphologies_gt
+```
+
+### AIC and BIC
+
+```{r aic}
+#| label: tbl-AIC
+#| tbl-cap: "AIC Values for Model Comparison"
+
+kable(aic_table, col.names = c("Model", "Df", "AIC")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r bic}
+#| label: tbl-BIC
+#| tbl-cap: "BIC Values for Model Comparison"
+
+kable(bic_table, col.names = c("Model", "Df", "BIC")) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
